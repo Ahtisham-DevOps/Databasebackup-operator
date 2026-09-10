@@ -1,0 +1,7 @@
+namespace: databasebackup-operator-system
+namePrefix: databasebackup-operator-
+
+resources:
+- ../crd
+- ../rbac
+- ../manager

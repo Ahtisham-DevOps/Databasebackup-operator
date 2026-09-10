@@ -1,0 +1,2 @@
+resources:
+- bases/backup.example.com_databasebackups.yaml

@@ -1,0 +1,9 @@
+apiVersion: backup.example.com/v1
+kind: DatabaseBackup
+metadata:
+  name: sample-backup
+  namespace: default
+spec:
+  schedule: "0 2 * * *"
+  targetDatabase: "postgres-secret"
+  retentionDays: 7
