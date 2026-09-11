@@ -66,7 +66,7 @@ func (r *DatabaseBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// Handle deletion
-	if !backup.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !backup.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&backup, databaseBackupFinalizer) {
 			log.Info("Cleaning up before delete", "name", backup.Name)
 			// TODO: real cleanup (delete stored backup files) yahan aayega
