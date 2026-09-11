@@ -1,135 +1,87 @@
-# databasebackup-operator
-// TODO(user): Add simple overview of use/purpose
+# DatabaseBackup Operator
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A production-grade Kubernetes Operator for automating scheduled database backups, built with Go, kubebuilder, and controller-runtime.
 
-## Getting Started
+## What It Does
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+`DatabaseBackup` is a Custom Resource that lets you declaratively manage database backup schedules on Kubernetes:
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/databasebackup-operator:tag
+```yaml
+apiVersion: backup.example.com/v1
+kind: DatabaseBackup
+metadata:
+  name: sample-backup
+spec:
+  schedule: "0 2 * * *"        # cron expression
+  targetDatabase: "postgres-secret"
+  retentionDays: 7
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+The controller reconciles this into a running backup schedule, tracking status in `.status`:
 
-**Install the CRDs into the cluster:**
+```json
+{
+  "backupCount": 1,
+  "lastBackupStatus": "Success",
+  "lastBackupTime": "2026-09-10T17:15:15Z"
+}
+```
 
-```sh
+## Architecture
+
+- **CRD**: schema-validated (`schedule`, `targetDatabase`, `retentionDays` required; `retentionDays` minimum 1)
+- **Reconciler**: idempotent, cron-aware, self-requeuing (no polling — waits until the next scheduled run)
+- **Finalizers**: guarantee cleanup runs before resource deletion
+- **RBAC**: least-privilege — scoped to `databasebackups` resources, leader election, and metrics only
+- **Metrics**: exposed on `/metrics` (authenticated, HTTPS) for Prometheus scraping
+
+## Prerequisites
+
+- Go 1.21+
+- Docker
+- `kubectl`
+- A Kubernetes cluster (tested with `kind`)
+
+## Installation
+
+```bash
+# Install the CRD
 make install
+
+# Build and load the image (for local kind clusters)
+make docker-build IMG=databasebackup-operator:v0.1.0
+kind load docker-image databasebackup-operator:v0.1.0 --name <your-cluster-name>
+
+# Deploy
+make deploy IMG=databasebackup-operator:v0.1.0
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+## Usage
 
-```sh
-make deploy IMG=<some-registry>/databasebackup-operator:tag
+```bash
+kubectl apply -f config/samples/backup_v1_databasebackup.yaml
+kubectl get databasebackup sample-backup -o jsonpath='{.status}'
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+## Testing
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
+```bash
+make test    # envtest — runs against a real fake API server, no live cluster needed
+make lint    # staticcheck
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+## Design Decisions & Lessons Learned
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+- **Idempotency guard**: an early version of the reconciler updated `.status` unconditionally on every reconcile, which itself triggered a new watch event — causing an infinite reconcile loop. Fixed by adding a guard that only runs a backup when one is actually due, based on the parsed cron schedule and `LastBackupTime`.
+- **Explicit requeue over polling**: instead of reconciling on a fixed interval, the controller calculates the next scheduled run and requeues exactly then (`RequeueAfter`), avoiding unnecessary API server load.
+- **Status as a subresource**: `.status` updates use `r.Status().Update()`, kept separate from `.spec` updates to avoid conflicts between user edits and controller writes.
 
-```sh
-kubectl delete -k config/samples/
-```
+## Known Limitations
 
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/databasebackup-operator:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/databasebackup-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+- Backup execution is currently simulated (no real `pg_dump`/`mysqldump` integration yet).
+- Retention policy (`retentionDays`) enforcement is not yet implemented — pending real backup storage integration.
+- e2e tests are temporarily disabled pending full metrics RBAC coverage in CI.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache 2.0
