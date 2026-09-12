@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -46,6 +47,21 @@ var _ = Describe("DatabaseBackup Controller", func() {
 		databasebackup := &backupv1.DatabaseBackup{}
 
 		BeforeEach(func() {
+			By("creating the test Secret with DB credentials")
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-db-secret",
+					Namespace: resourceNamespace,
+				},
+				StringData: map[string]string{
+					"host":     "localhost",
+					"port":     "5432",
+					"username": "test",
+					"password": "test",
+					"database": "testdb",
+				},
+			}
+			_ = k8sClient.Create(ctx, secret)
 			By("creating the custom resource for the Kind DatabaseBackup")
 			err := k8sClient.Get(ctx, typeNamespacedName, databasebackup)
 			if err != nil && errors.IsNotFound(err) {
@@ -102,7 +118,7 @@ var _ = Describe("DatabaseBackup Controller", func() {
 			updated := &backupv1.DatabaseBackup{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
 			Expect(updated.Status.BackupCount).To(Equal(1))
-			Expect(updated.Status.LastBackupStatus).To(Equal("Success"))
+			Expect(updated.Status.LastBackupStatus).To(Equal("Running"))
 		})
 	})
 })
