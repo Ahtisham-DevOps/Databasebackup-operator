@@ -18,9 +18,13 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/robfig/cron/v3"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -42,6 +46,8 @@ type DatabaseBackupReconciler struct {
 // +kubebuilder:rbac:groups=backup.example.com,resources=databasebackups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=backup.example.com,resources=databasebackups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=backup.example.com,resources=databasebackups/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -90,6 +96,10 @@ func (r *DatabaseBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
+	if backup.Status.LastBackupStatus == "Running" {
+		return r.checkJobStatus(ctx, &backup)
+	}
+
 	schedule, err := cron.ParseStandard(backup.Spec.Schedule)
 	if err != nil {
 		log.Error(err, "invalid cron schedule", "schedule", backup.Spec.Schedule)
@@ -112,13 +122,119 @@ func (r *DatabaseBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return r.runBackup(ctx, &backup, now)
 }
 
+func (r *DatabaseBackupReconciler) fetchDBCredentials(ctx context.Context, backup *backupv1.DatabaseBackup) (map[string]string, error) {
+	var secret corev1.Secret
+	secretKey := client.ObjectKey{
+		Name:      backup.Spec.TargetDatabase,
+		Namespace: backup.Namespace,
+	}
+
+	if err := r.Get(ctx, secretKey, &secret); err != nil {
+		return nil, fmt.Errorf("failed to fetch secret %s: %w", backup.Spec.TargetDatabase, err)
+	}
+
+	creds := map[string]string{
+		"host":     string(secret.Data["host"]),
+		"port":     string(secret.Data["port"]),
+		"username": string(secret.Data["username"]),
+		"password": string(secret.Data["password"]),
+		"database": string(secret.Data["database"]),
+	}
+
+	// Validate required fields present
+	for k, v := range creds {
+		if v == "" {
+			return nil, fmt.Errorf("secret %s missing required field: %s", backup.Spec.TargetDatabase, k)
+		}
+	}
+
+	return creds, nil
+}
+
 func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backupv1.DatabaseBackup, now time.Time) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	log.Info("Running backup", "targetDatabase", backup.Spec.TargetDatabase)
+
+	creds, err := r.fetchDBCredentials(ctx, backup)
+	if err != nil {
+		log.Error(err, "unable to fetch DB credentials")
+		backup.Status.LastBackupStatus = "Failed"
+		_ = r.Status().Update(ctx, backup)
+		return ctrl.Result{}, err
+	}
+
+	jobName := fmt.Sprintf("%s-backup-%d", backup.Name, now.Unix())
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "databasebackup-operator",
+				"backup.example.com/owner":     backup.Name,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: int32Ptr(1),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:  "pg-dump",
+							Image: "postgres:16",
+							Command: []string{
+								"sh", "-c",
+								fmt.Sprintf(
+									"PGPASSWORD=$DB_PASSWORD pg_dump -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -f /backup/%s.sql",
+									jobName,
+								),
+							},
+							Env: []corev1.EnvVar{
+								{Name: "DB_HOST", Value: creds["host"]},
+								{Name: "DB_PORT", Value: creds["port"]},
+								{Name: "DB_USER", Value: creds["username"]},
+								{Name: "DB_PASSWORD", Value: creds["password"]},
+								{Name: "DB_NAME", Value: creds["database"]},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "backup-storage", MountPath: "/backup"},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "backup-storage",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "backup-storage",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(backup, job, r.Scheme); err != nil {
+		log.Error(err, "unable to set owner reference on Job")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			log.Error(err, "unable to create backup Job")
+			backup.Status.LastBackupStatus = "Failed"
+			_ = r.Status().Update(ctx, backup)
+			return ctrl.Result{}, err
+		}
+	}
+
+	log.Info("Backup Job created", "jobName", jobName)
 
 	backupTime := metav1.NewTime(now)
 	backup.Status.LastBackupTime = &backupTime
-	backup.Status.LastBackupStatus = "Success"
+	backup.Status.LastBackupStatus = "Running"
 	backup.Status.BackupCount = backup.Status.BackupCount + 1
 
 	if err := r.Status().Update(ctx, backup); err != nil {
@@ -128,6 +244,129 @@ func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backup
 
 	log.Info("Backup status updated", "backupCount", backup.Status.BackupCount)
 	return ctrl.Result{}, nil
+}
+
+func (r *DatabaseBackupReconciler) checkJobStatus(ctx context.Context, backup *backupv1.DatabaseBackup) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	jobName := fmt.Sprintf("%s-backup-%d", backup.Name, backup.Status.LastBackupTime.Time.Unix())
+
+	var job batchv1.Job
+	if err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: backup.Namespace}, &job); err != nil {
+		log.Error(err, "unable to fetch backup Job", "jobName", jobName)
+		backup.Status.LastBackupStatus = "Failed"
+		_ = r.Status().Update(ctx, backup)
+		return ctrl.Result{}, err
+	}
+
+	if job.Status.Succeeded > 0 {
+		log.Info("Backup Job completed successfully", "jobName", jobName)
+		backup.Status.LastBackupStatus = "Success"
+		if err := r.Status().Update(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if err := r.enforceRetention(ctx, backup); err != nil {
+			log.Error(err, "retention enforcement failed")
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if job.Status.Failed > 0 {
+		log.Info("Backup Job failed", "jobName", jobName)
+		backup.Status.LastBackupStatus = "Failed"
+		if err := r.Status().Update(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	log.Info("Backup Job still running, will check again", "jobName", jobName)
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+func (r *DatabaseBackupReconciler) enforceRetention(ctx context.Context, backup *backupv1.DatabaseBackup) error {
+	log := logf.FromContext(ctx)
+
+	var jobList batchv1.JobList
+	if err := r.List(ctx, &jobList, client.InNamespace(backup.Namespace), client.MatchingLabels{
+		"backup.example.com/owner": backup.Name,
+	}); err != nil {
+		return fmt.Errorf("failed to list backup jobs: %w", err)
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -backup.Spec.RetentionDays)
+	deletedCount := 0
+
+	for _, job := range jobList.Items {
+		if job.CreationTimestamp.Time.Before(cutoff) {
+			if err := r.Delete(ctx, &job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "failed to delete old job", "job", job.Name)
+				continue
+			}
+			deletedCount++
+		}
+	}
+
+	if deletedCount > 0 {
+		log.Info("Retention: deleted old backup jobs", "count", deletedCount, "retentionDays", backup.Spec.RetentionDays)
+	}
+
+	// Cleanup old files on PVC via a short-lived Job
+	cleanupJobName := fmt.Sprintf("%s-cleanup-%d", backup.Name, time.Now().Unix())
+	cleanupJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cleanupJobName,
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "databasebackup-operator",
+				"backup.example.com/owner":     backup.Name,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: int32Ptr(1),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "cleanup",
+							Image:   "busybox",
+							Command: []string{"sh", "-c", fmt.Sprintf("find /backup -type f -name '*.sql' -mtime +%d -delete", backup.Spec.RetentionDays)},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "backup-storage", MountPath: "/backup"},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "backup-storage",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "backup-storage",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(backup, cleanupJob, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on cleanup job: %w", err)
+	}
+
+	if err := r.Create(ctx, cleanupJob); err != nil && !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create cleanup job: %w", err)
+	}
+
+	log.Info("Retention: cleanup job created", "jobName", cleanupJobName)
+	return nil
+}
+func int32Ptr(i int32) *int32 {
+	return &i
 }
 
 // SetupWithManager sets up the controller with the Manager.
