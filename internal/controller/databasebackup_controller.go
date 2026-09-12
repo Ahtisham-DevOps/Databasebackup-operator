@@ -36,6 +36,13 @@ import (
 )
 
 const databaseBackupFinalizer = "backup.example.com/finalizer"
+const (
+	statusFailed        = "Failed"
+	statusSuccess       = "Success"
+	statusRunning       = "Running"
+	backupOwnerLabel    = "backup.example.com/owner"
+	backupStorageVolume = "backup-storage"
+)
 
 // DatabaseBackupReconciler reconciles a DatabaseBackup object
 type DatabaseBackupReconciler struct {
@@ -96,7 +103,7 @@ func (r *DatabaseBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	if backup.Status.LastBackupStatus == "Running" {
+	if backup.Status.LastBackupStatus == statusRunning {
 		return r.checkJobStatus(ctx, &backup)
 	}
 
@@ -157,7 +164,7 @@ func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backup
 	creds, err := r.fetchDBCredentials(ctx, backup)
 	if err != nil {
 		log.Error(err, "unable to fetch DB credentials")
-		backup.Status.LastBackupStatus = "Failed"
+		backup.Status.LastBackupStatus = statusFailed
 		_ = r.Status().Update(ctx, backup)
 		return ctrl.Result{}, err
 	}
@@ -170,7 +177,7 @@ func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backup
 			Namespace: backup.Namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "databasebackup-operator",
-				"backup.example.com/owner":     backup.Name,
+				backupOwnerLabel:               backup.Name,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -197,16 +204,16 @@ func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backup
 								{Name: "DB_NAME", Value: creds["database"]},
 							},
 							VolumeMounts: []corev1.VolumeMount{
-								{Name: "backup-storage", MountPath: "/backup"},
+								{Name: backupStorageVolume, MountPath: "/backup"},
 							},
 						},
 					},
 					Volumes: []corev1.Volume{
 						{
-							Name: "backup-storage",
+							Name: backupStorageVolume,
 							VolumeSource: corev1.VolumeSource{
 								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: "backup-storage",
+									ClaimName: backupStorageVolume,
 								},
 							},
 						},
@@ -224,7 +231,7 @@ func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backup
 	if err := r.Create(ctx, job); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			log.Error(err, "unable to create backup Job")
-			backup.Status.LastBackupStatus = "Failed"
+			backup.Status.LastBackupStatus = statusFailed
 			_ = r.Status().Update(ctx, backup)
 			return ctrl.Result{}, err
 		}
@@ -234,7 +241,7 @@ func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backup
 
 	backupTime := metav1.NewTime(now)
 	backup.Status.LastBackupTime = &backupTime
-	backup.Status.LastBackupStatus = "Running"
+	backup.Status.LastBackupStatus = statusRunning
 	backup.Status.BackupCount = backup.Status.BackupCount + 1
 
 	if err := r.Status().Update(ctx, backup); err != nil {
@@ -249,19 +256,19 @@ func (r *DatabaseBackupReconciler) runBackup(ctx context.Context, backup *backup
 func (r *DatabaseBackupReconciler) checkJobStatus(ctx context.Context, backup *backupv1.DatabaseBackup) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	jobName := fmt.Sprintf("%s-backup-%d", backup.Name, backup.Status.LastBackupTime.Time.Unix())
+	jobName := fmt.Sprintf("%s-backup-%d", backup.Name, backup.Status.LastBackupTime.Unix())
 
 	var job batchv1.Job
 	if err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: backup.Namespace}, &job); err != nil {
 		log.Error(err, "unable to fetch backup Job", "jobName", jobName)
-		backup.Status.LastBackupStatus = "Failed"
+		backup.Status.LastBackupStatus = statusFailed
 		_ = r.Status().Update(ctx, backup)
 		return ctrl.Result{}, err
 	}
 
 	if job.Status.Succeeded > 0 {
 		log.Info("Backup Job completed successfully", "jobName", jobName)
-		backup.Status.LastBackupStatus = "Success"
+		backup.Status.LastBackupStatus = statusSuccess
 		if err := r.Status().Update(ctx, backup); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -275,7 +282,7 @@ func (r *DatabaseBackupReconciler) checkJobStatus(ctx context.Context, backup *b
 
 	if job.Status.Failed > 0 {
 		log.Info("Backup Job failed", "jobName", jobName)
-		backup.Status.LastBackupStatus = "Failed"
+		backup.Status.LastBackupStatus = statusFailed
 		if err := r.Status().Update(ctx, backup); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -291,7 +298,7 @@ func (r *DatabaseBackupReconciler) enforceRetention(ctx context.Context, backup 
 
 	var jobList batchv1.JobList
 	if err := r.List(ctx, &jobList, client.InNamespace(backup.Namespace), client.MatchingLabels{
-		"backup.example.com/owner": backup.Name,
+		backupOwnerLabel: backup.Name,
 	}); err != nil {
 		return fmt.Errorf("failed to list backup jobs: %w", err)
 	}
@@ -321,7 +328,7 @@ func (r *DatabaseBackupReconciler) enforceRetention(ctx context.Context, backup 
 			Namespace: backup.Namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "databasebackup-operator",
-				"backup.example.com/owner":     backup.Name,
+				backupOwnerLabel:               backup.Name,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -335,16 +342,16 @@ func (r *DatabaseBackupReconciler) enforceRetention(ctx context.Context, backup 
 							Image:   "busybox",
 							Command: []string{"sh", "-c", fmt.Sprintf("find /backup -type f -name '*.sql' -mtime +%d -delete", backup.Spec.RetentionDays)},
 							VolumeMounts: []corev1.VolumeMount{
-								{Name: "backup-storage", MountPath: "/backup"},
+								{Name: backupStorageVolume, MountPath: "/backup"},
 							},
 						},
 					},
 					Volumes: []corev1.Volume{
 						{
-							Name: "backup-storage",
+							Name: backupStorageVolume,
 							VolumeSource: corev1.VolumeSource{
 								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: "backup-storage",
+									ClaimName: backupStorageVolume,
 								},
 							},
 						},
